@@ -311,6 +311,87 @@ def test_disable_stemmer_behavior(disable_stemmer: bool) -> None:
     assert result == expected, f"Expected {expected}, but got {result}"
 
 
+class _PolishStemmer:
+    def stem_word(self, word: str) -> str:
+        for suffix in ("ami", "ach"):
+            if word.endswith(suffix):
+                return word[: -len(suffix)]
+        return word
+
+
+def test_custom_stemmer_applies_to_documents_and_queries() -> None:
+    model = SparseTextEmbedding(
+        "Qdrant/bm25",
+        language="polish",
+        stemmer=_PolishStemmer(),
+        stopwords={"W"},
+        k=1.0,
+        b=0.0,
+    )
+    text = "Kotami kotach w domach!"
+    document = next(iter(model.embed(text)))
+    query = next(iter(model.query_embed(text)))
+
+    assert dict(zip(document.indices, document.values)) == pytest.approx(
+        {Bm25.compute_token_id("kot"): 4 / 3, Bm25.compute_token_id("dom"): 1.0}
+    )
+    assert dict(zip(query.indices, query.values)) == {
+        Bm25.compute_token_id("kot"): 1.0,
+        Bm25.compute_token_id("dom"): 1.0,
+    }
+
+
+@pytest.mark.parametrize(
+    "disable_stemmer,stopwords,expected",
+    [
+        (False, None, ["fox"]),
+        (True, None, ["the", "and", "fox"]),
+        (False, set(), ["the", "and", "fox"]),
+        (True, set(), ["the", "and", "fox"]),
+        (False, {"The", "FOX"}, ["and"]),
+        (True, {"The", "FOX"}, ["and"]),
+    ],
+)
+def test_stopword_precedence(
+    stopwords: set[str] | None, disable_stemmer: bool, expected: list[str]
+) -> None:
+    model = Bm25(
+        "Qdrant/bm25",
+        stopwords=stopwords,
+        disable_stemmer=disable_stemmer,
+    )
+
+    assert model._stem(["THE", "and", "FOX"]) == expected
+
+
+def test_unsupported_language_requires_custom_or_disabled_stemmer() -> None:
+    with pytest.raises(ValueError, match="polish language is not supported"):
+        Bm25("Qdrant/bm25", language="polish", stopwords=set())
+
+
+def test_custom_and_disabled_stemmer_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="stemmer cannot be supplied with disable_stemmer=True"):
+        Bm25("Qdrant/bm25", stemmer=_PolishStemmer(), disable_stemmer=True)
+
+
+def test_parallel_matches_serial() -> None:
+    model = SparseTextEmbedding(
+        "Qdrant/bm25",
+        language="polish",
+        stemmer=_PolishStemmer(),
+        stopwords={"w", "kotami"},
+    )
+    documents = ["Kotami kotach w domach", "W domach", "", "kotami"]
+    serial = list(model.embed(documents))
+    # More documents than batch_size ensures this actually starts worker processes.
+    parallel = list(model.embed(documents, batch_size=2, parallel=2))
+
+    assert len(serial) == len(parallel) == len(documents)
+    for expected, actual in zip(serial, parallel):
+        assert actual.indices.tolist() == expected.indices.tolist()
+        assert actual.values.tolist() == pytest.approx(expected.values.tolist())
+
+
 def test_if_splade_query_embed_is_inference_free() -> None:
     is_ci = os.getenv("CI")
     model = SparseTextEmbedding(
